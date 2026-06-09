@@ -37,6 +37,32 @@ prepare.py
 
 ---
 
+### 1.1 prepare.py 模块功能图
+
+```mermaid
+graph TB
+    subgraph 准备阶段[准备阶段 - 人类执行一次]
+        D1["📥 数据下载模块<br/>download_data()"] -->|并行下载| PQ["Apache Parquet shards<br/>~/.cache/autoresearch/data/"]
+        D2["🏷️ Tokenizer 训练<br/>train_tokenizer()"] -->|rustbpe 训练 BPE| TOK["tiktoken tokenizer.pkl<br/>+ token_bytes.pt"]
+    end
+
+    subgraph 运行时[运行时 - 训练循环使用]
+        DL["🔄 DataLoader<br/>make_dataloader()"]
+        EV["📐 BPB 评估<br/>evaluate_bpb()"]
+
+        PQ --> DL
+        TOK --> DL
+        TOK -->|token_bytes 查表| EV
+        DL -->|feed| TrainLoop["模型训练循环<br/>(train.py)"]
+        TrainLoop -->|model| EV
+    end
+
+    style 准备阶段 fill:#dbeafe
+    style 运行时 fill:#fef3c7
+```
+
+---
+
 ## 二、常量详解
 
 ```python
@@ -63,6 +89,28 @@ SPLIT_PATTERN = r'''
     |\s+(?!\S)                         # 尾随空格
     |\s+                               # 其他空白
 '''
+```
+
+---
+
+### 2.1 数据下载与重试机制流程图
+
+```mermaid
+flowchart LR
+    Start([开始下载]) --> Check["📁 shard 是否已存在?"]
+    Check -->|是| Skip["⏭️ 跳过"]
+    Check -->|否| Download["🌐 HTTP 请求 Parquet 文件<br/>(timeout=30s, 流式 1MB chunks)"]
+
+    Download -->|成功| Write["💾 原子写入<br/>→ .tmp → 重命名"]
+    Write --> FileOk("✅ 完成")
+
+    Download -->|失败| Wait["⏰ 指数退避<br/>2^attempt 秒"]
+    Wait -->|attempt < 5| Download
+    Wait -->|attempt >= 5| Fail("❌ 放弃")
+
+    style Skip fill:#d1d5db
+    style FileOk fill:#86efac
+    style Fail fill:#fca5a5
 ```
 
 ---
@@ -159,6 +207,27 @@ Step 5:  sanity check (encode/decode roundtrip)
 - 特殊 token `<|reserved_0|>` → 0 bytes（排除在 BPB 计算之外）
 
 在评估时直接查表 `token_bytes[y_flat]`，避免每次都做 UTF-8 编码。
+
+---
+
+### 4.1 Tokenizer 训练与转换流水线
+
+```mermaid
+flowchart TD
+    Raw["📜 Parquet 原始文本<br/>(10亿 chars 语料)"] --> RustBPE["🦀 rustbpe 训练 BPE<br/>(Rust 实现, 极快)"]
+    RustBPE -->|merges| TikToken["🔤 tiktoken Encoding<br/>(Python 推理用)"]
+
+    TikToken -->|序列化| Pkl["💾 tokenizer.pkl"]
+    TikToken -->|每个 token 解码| ByteLen["📐 计算 UTF-8 字节长度<br/>(逐个 token)"]
+    ByteLen -->|保存| BytesPT["torch.tensor → token_bytes.pt<br/>[vocab_size] int32"]
+
+    Pkl -->|训练时加载| Encode["🧠 encode_ordinary_batch<br/>(多线程 tokenize)"]
+    BytesPT -->|训练时加载| BPBLookup["📐 BPB 查表<br/>token_bytes[y_flat]"]
+
+    style RustBPE fill:#fecaca
+    style TikToken fill:#bfdbfe
+    style BPBLookup fill:#dcfce7
+```
 
 ---
 
