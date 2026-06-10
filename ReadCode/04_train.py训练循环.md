@@ -46,6 +46,31 @@ grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd  # 524288 // 262144 = 2
 
 ---
 
+### 1.1 训练单步时序流（一个 optimizer step）
+
+```mermaid
+gantt
+    title 单步训练时序 (≈350ms on H100)
+    dateFormat  YYYY-MM-DD
+    axisFormat %H:%M
+    section 前向/反向（Micro-batch 0）
+        Forward BF16 :a1, 2025-01-01, 100ms
+        Backward + Grad Accum :after a1, 200ms
+    section 调度 + 优化器
+        LR/Momentum/WD Scheduling :a2, 2025-01-01, 10ms
+        Muon (Polar+NorMuon+CWD) :after a2, 15ms
+        AdamW (Embeddings+Scalars) :after a2, 5ms
+        zero_grad :a3, 2025-01-01, 1ms
+    section 日志 + 监控
+        Loss EMA :a4, 2025-01-01, 2ms
+        MFU + tok/s 计算 :after a4, 1ms
+    section 检查
+        NaN/爆炸检测 :crit, a5, 2025-01-01, 1ms
+        GC 管理 (step==0时禁用) :a6, 2025-01-01, 0ms
+```
+
+---
+
 ## 二、模型初始化流程
 
 ```python
@@ -102,6 +127,20 @@ x, y, epoch = next(train_loader)  # 第一个 batch 已在 GPU 上
 
 ### 3.1 LR 乘数（随训练进度变化）
 
+#### 3.1.1 两阶段调度：恒定 → 线性冷却
+
+```mermaid
+graph TD
+    subgraph 训练时间轴 [0% → 100% (5 分钟 = 300 秒)]
+        A["0% → 50%<br/>(0 ~ 150 秒)<br/>lr_mult = 1.0<br/>恒定学习率<br/>(快速收敛阶段)"]
+        B["50% → 100%<br/>(150 ~ 300 秒)<br/>lr_mult = 1.0 → 0<br/>线性冷却<br/>(平滑收敛到 0)"]
+        A --> B
+    end
+
+    style A fill:#bfdbfe
+    style B fill:#fde68a
+```
+
 ```python
 def get_lr_multiplier(progress):
     """progress = 已训练时间 / TIME_BUDGET (0.0 ~ 1.0)"""
@@ -141,6 +180,27 @@ def get_weight_decay(progress):
 ---
 
 ## 四、训练循环详解
+
+### 4.1 训练循环全景时序（单 step 内部结构）
+
+```mermaid
+flowchart TD
+    Sync["⏱️ torch.cuda.synchronize()<br/>等待 GPU 完成"] -->
+    Fwd["🧠 Forward + Backward × 2<br/>(梯度累积)<br/>BF16 autocast"] -->
+    Next["📦 next(train_loader)<br/>预取 batch (CPU overlap)"] -->
+    Sched["📅 调度: lr + momentum + weight_decay<br/>按 progress 计算"] -->
+    Opt["🟣 optimizer.step()<br/>Muon + AdamW"] -->
+    ZG["🧹 zero_grad(set_to_none=True)"] -->
+    Fail["⚠️ NaN/loss>100 检测<br/>失败即退出"] -->
+    Metrics["📊 计算 MFU + tok/s + 平滑 loss"] -->
+    Log["🖨️ 打印 (\\r 覆盖)<br/>progress % 显示"] -->
+    GC{"step == 0?"}
+    GC -->|是| Freeze["❄️ gc.collect() + gc.freeze() + gc.disable()<br/>永久对象冻结，避免 GC 开销"] --> Incr["step += 1"]
+    GC -->|否| Incr
+    Incr --> TimeCheck{"total_time ≥ TIME_BUDGET<br/>且 step > 10?"}
+    TimeCheck -->|是| Eval["📐 运行 val_bpb 评估"]
+    TimeCheck -->|否| Sync
+```
 
 ```python
 t_start_training = time.time()

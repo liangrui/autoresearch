@@ -10,6 +10,34 @@
 
 ## 一、总体流程
 
+### 1.1 Agent 自主实验循环流程图
+
+```mermaid
+flowchart TD
+    Start(["🤖 Agent 启动"]) -->
+    Read["📖 读取 README + prepare.py + train.py<br/>(理解约束和可修改范围)"] -->
+    Init["📊 初始化 results.tsv<br/>(如果不存在)"] -->
+    LoopStart(["🔄 实验循环 FOREVER"])
+
+    LoopStart --> Modify["✏️ 修改 train.py<br/>(模型架构/超参/优化器)"]
+    Modify --> Commit["🌿 git commit<br/>(记录当前修改)"]
+    Commit --> Train["⚙️ 运行训练 5 分钟<br/>(python train.py)"]
+
+    Train --> ResultCheck{"结果?"}
+
+    ResultCheck -->|✅ val_bpb 下降| Keep["✅ 保留 commit<br/>(进步!)<br/>记录到 results.tsv"] --> Next["💡 产生下一个想法"]
+    ResultCheck -->|⚠️ val_bpb 不变/上升| Reset["🔄 git reset --hard<br/>(丢弃本次修改)"] --> Next
+    ResultCheck -->|💥 Crash| Crash["🔧 尝试修复<br/>或记录并 skip"] --> Next
+
+    Next --> Modify
+
+    style Train fill:#fecaca
+    style Keep fill:#dcfce7
+    style Reset fill:#fee2e2
+    style Crash fill:#fde68a
+    style Modify fill:#bfdbfe
+```
+
 ```
 人类确认分支 → Agent 读取 README + prepare.py + train.py
     ↓

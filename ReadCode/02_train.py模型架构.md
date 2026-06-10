@@ -52,6 +52,53 @@ GPT 模型 (train.py:124-291)
 
 ---
 
+### 1.1 GPT 模型完整架构图（DEPTH=8）
+
+```mermaid
+graph TB
+    Input["📥 idx [B=128, T=2048]<br/>token ids"] --> Emb["📊 wte: Embedding<br/>(vocab_size → 512)"]
+    Emb --> Norm0["RMSNorm(x)"]
+    Norm0 --> X0["💾 x0 = x<br/>(保存原始嵌入用于 x0 shortcut)"]
+
+    X0 --> Block1["🔲 Block 0"]
+    Block1 --> Block2["🔲 Block 1"]
+    Block2 --> Block3["🔲 Block 2"]
+    Block3 --> Block4["🔲 Block 3"]
+    Block4 --> Block5["🔲 Block 4"]
+    Block5 --> Block6["🔲 Block 5"]
+    Block6 --> Block7["🔲 Block 6"]
+    Block7 --> Block8["🔲 Block 7"]
+
+    Block8 --> FinalNorm["RMSNorm(x)<br/>最终归一化"]
+    FinalNorm --> LMHead["📈 LM Head<br/>Linear(512 → vocab_size)<br/>bias=False"]
+    LMHead --> SoftCap["🎯 Logit Softcap<br/>15 × tanh(logits / 15)"]
+    SoftCap --> Loss["📉 Cross Entropy Loss<br/>(reduction='mean' 或 'none')"]
+
+    subgraph Block[每个 Transformer Block 内部]
+        direction LR
+        BlockIn["x (来自上一层)"] --> X0Mix["x0 混合<br/>x = λ_resid * x + λ_x0 * x0"]
+        X0Mix --> Attn["⚡ Causal Self-Attention<br/>(RMSNorm → QKV → RoPE → Q/K Norm → FlashAttn3 → 输出投影)"]
+        Attn --> Res1["残差 +"]
+        Res1 --> MLP["🧠 MLP<br/>(RMSNorm → Linear → ReLU² → Linear)"]
+        MLP --> Res2["残差 +"]
+        Res2 --> BlockOut["y (到下一层)"]
+    end
+
+    style Input fill:#dbeafe
+    style Loss fill:#fecaca
+    style Emb fill:#fde68a
+    style LMHead fill:#fde68a
+    style BlockIn fill:#e5e7eb
+    style BlockOut fill:#e5e7eb
+    style X0Mix fill:#ddd6fe
+    style Attn fill:#bfdbfe
+    style MLP fill:#bbf7d0
+```
+
+> **交替层 VE 设计**：Block 1, 3, 5, 7 有 ResFormer Value Embedding（交替层），其他层没有。
+
+---
+
 ## 二、配置类与模型构建
 
 ```python
@@ -147,6 +194,39 @@ def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000):
 
 ---
 
+### 4.1 RoPE 位置编码数据流图
+
+```mermaid
+graph LR
+    Q["Q [B, T, H, D_head]"] --> RoPE1["Apply RoPE<br/>q * cos + rotate(q) * sin"]
+    K["K [B, T, H, D_head]"] --> RoPE2["Apply RoPE<br/>k * cos + rotate(k) * sin"]
+
+    Precomp["📦 预计算 cos/sin<br/>[1, T, 1, D_head/2]<br/>rotary_seq_len = T × 10"] --> RoPE1
+    Precomp --> RoPE2
+
+    RoPE1 --> NQ["RMSNorm(Q)<br/>(额外归一化!)"]
+    RoPE2 --> NK["RMSNorm(K)<br/>(额外归一化!)"]
+
+    NQ --> Flash["⚡ Flash Attention 3<br/>causal=True<br/>window_size=SSSL/∞"]
+    NK --> Flash
+    V["V [B, T, H, D_head]"] --> Flash
+
+    Flash --> Out["O [B, T, H, D_head]"]
+    Out --> Proj["Linear<br/>(zero-init 残差初始为 0)"]
+
+    style Q fill:#dbeafe
+    style K fill:#dbeafe
+    style V fill:#dbeafe
+    style Flash fill:#fecaca
+    style Precomp fill:#fef3c7
+    style NQ fill:#ddd6fe
+    style NK fill:#ddd6fe
+```
+
+> **关键创新**：Q, K 在 RoPE 之后各自做 RMSNorm — 稳定注意力分数分布，防止深层网络中数值爆炸。
+
+---
+
 ## 五、Causal Self-Attention 详解
 
 ```python
@@ -197,6 +277,38 @@ class CausalSelfAttention(nn.Module):
         # Step 6: 输出投影
         y = self.c_proj(y)
         return y
+```
+
+### 5.0.1 Causal Self-Attention 内部计算流
+
+```mermaid
+graph TD
+    X["x [B, T, 512]<br/>(RMSNorm 后的输入)"] --> Q["Linear → Q<br/>[B, T, 4 × 128]"]
+    X --> K["Linear → K<br/>[B, T, 4 × 128]"]
+    X --> V["Linear → V<br/>[B, T, 4 × 128]"]
+
+    Idx["idx = input token ids"] --> VE["💡 Value Embedding<br/>nn.Embedding(vocab, 4×128)<br/>(交替层才有!)"]
+    VE --> Gate["🚪 ve_gate(x[:32])<br/>2 × sigmoid(Linear(32→4))<br/>[B, T, 4]"]
+    Gate --> VAdd["+ 残差混合<br/>V = V + gate.unsqueeze(-1) * ve"]
+
+    Q --> QRoPE["🧭 RoPE(Q)"]
+    K --> KRoPE["🧭 RoPE(K)"]
+    QRoPE --> QNorm["RMSNorm(Q)"]
+    KRoPE --> KNorm["RMSNorm(K)"]
+
+    QNorm --> FA3["⚡ Flash Attention 3<br/>causal=True<br/>window_size = SSSL pattern"]
+    KNorm --> FA3
+    VAdd --> FA3
+
+    FA3 --> AttnOut["O [B, T, 512]"]
+    AttnOut --> OProj["Linear(512→512)<br/>zero-init!"]
+    OProj --> Y["y = x + OProj(O)<br/>(残差连接)"]
+
+    style X fill:#dbeafe
+    style VE fill:#fecaca
+    style Gate fill:#ddd6fe
+    style FA3 fill:#fef3c7
+    style Y fill:#dcfce7
 ```
 
 ### 5.1 ResFormer Value Embedding 机制
@@ -273,6 +385,35 @@ def _compute_window_sizes(self, config):
 | 5 | S | 1024 |  |
 | 6 | S | 1024 |  |
 | 7 | L | 2048 | 最后一层：强制全上下文 |
+
+### 6.1 滑动窗口注意力模式图
+
+```mermaid
+graph TD
+    subgraph 8层Transformer的窗口模式
+        L0["Layer 0<br/>📏 Window=1024 (短)<br/>→ 局部语法/短语"]
+        L1["Layer 1<br/>📏 Window=1024 (短)<br/>→ 局部模式"]
+        L2["Layer 2<br/>📏 Window=1024 (短)<br/>→ 局部模式"]
+        L3["Layer 3<br/>🌐 Window=2048 (全)<br/>→ 中距离整合"]
+        L4["Layer 4<br/>📏 Window=1024 (短)"]
+        L5["Layer 5<br/>📏 Window=1024 (短)"]
+        L6["Layer 6<br/>📏 Window=1024 (短)"]
+        L7["Layer 7<br/>🌐 Window=2048 (全, 强制!)<br/>→ 全局语义整合"]
+    end
+
+    L0 --> L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
+
+    style L0 fill:#bfdbfe
+    style L1 fill:#bfdbfe
+    style L2 fill:#bfdbfe
+    style L4 fill:#bfdbfe
+    style L5 fill:#bfdbfe
+    style L6 fill:#bfdbfe
+    style L3 fill:#fecaca
+    style L7 fill:#fecaca
+```
+
+> **SSSL 模式周期**：每 4 层为一个周期（短-短-短-长），但最后一层总是全窗口（强制确保输出层能看到全部历史）。
 
 **设计直觉**：
 - 浅层处理局部模式（不需要全上下文）
@@ -388,6 +529,35 @@ def forward(self, idx, targets=None, reduction='mean'):
   
 x0 Shortcut:
   x_{l+1} = resid_lambda_l × x_l + x0_lambda_l × x_0 + F_l(x_l)
+```
+
+### 9.1 x0 Shortcut 机制可视化
+
+```mermaid
+graph TD
+    subgraph 标准 Transformer
+        S0["x0 (输入嵌入)"] --> L1["Block 0 → x1"]
+        L1 --> L2["Block 1 → x2"]
+        L2 --> Ldots["..."]
+        Ldots --> Ln["Block 7 → x8 (输出)"]
+    end
+
+    subgraph 此项目 - x0 Shortcut
+        X0["x0 (原始嵌入)"] --> B1["Block 0"]
+        B1 --> X1["x1 = λ_resid0*x1 + λ_x00*x0"]
+        X0 -->|shortcut| X1
+        X1 --> B2["Block 1"]
+        X0 -->|shortcut| X2["x2 = λ_resid1*x2 + λ_x01*x0"]
+        B2 --> X2
+        X2 --> Bdots["..."]
+        X0 -->|shortcut| X8["x8 = λ_resid7*x8 + λ_x07*x0"]
+        Bdots --> B8["Block 7"]
+        B8 --> X8
+        X8 --> Out["最终输出"]
+    end
+
+    style 标准 Transformer fill:#fee2e2
+    style 此项目 fill:#dcfce7
 ```
 
 **直觉**：每一层都可以直接"参考"原始 token embedding。对于深层网络，这提供了一个梯度高速通道，让深层可以直接从输入提取信息。

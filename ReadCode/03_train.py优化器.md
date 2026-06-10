@@ -23,6 +23,41 @@ def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2,
     #   ADAM_BETAS = (0.8, 0.95)
 ```
 
+### 0.1 优化器整体架构图：Muon + AdamW 混合策略
+
+```mermaid
+graph TB
+    subgraph 模型参数[模型全部参数]
+        Emb["📊 词嵌入 + Value Embeddings<br/>(2D 矩阵)"]
+        LM["📈 LM Head<br/>(2D 矩阵)"]
+        Lambdas["🎚️ resid_lambdas + x0_lambdas<br/>(1D 向量 - 标量)"]
+        Transformer["🧠 Transformer 矩阵<br/>(Q/K/V/proj/MLP up/down, 多个 2D 矩阵)"]
+    end
+
+    subgraph 优化器分支[按参数类型分派到不同优化器]
+        AdamW1["📘 AdamW<br/>lr=0.6 (embedding)<br/>betas=(0.8, 0.95)<br/>eps=1e-10"]
+        AdamW2["📘 AdamW<br/>lr=0.004 (LM head)<br/>betas=(0.8, 0.95)<br/>eps=1e-10"]
+        AdamW3["📘 AdamW<br/>lr=0.05/0.5 (scalars)<br/>betas=(0.8/0.96, 0.95)"]
+        Muon["🟣 Muon 优化器<br/>lr=0.04 (按形状分组)<br/>momentum=0.85→0.95<br/>ns_steps=5 (Newton-Schulz)<br/>beta2=0.95<br/>weight_decay=0.2→0"]
+    end
+
+    Emb --> AdamW1
+    LM --> AdamW2
+    Lambdas --> AdamW3
+    Transformer -->|按形状分组| Muon
+
+    AdamW1 --> Scheduler["📅 LR Scheduler<br/>(恒定 → 线性衰减到 0)"]
+    AdamW2 --> Scheduler
+    AdamW3 --> Scheduler
+    Muon --> Scheduler
+
+    style 模型参数 fill:#dbeafe
+    style AdamW1 fill:#bfdbfe
+    style AdamW2 fill:#bfdbfe
+    style AdamW3 fill:#bfdbfe
+    style Muon fill:#ddd6fe
+```
+
 ### 参数组配置表
 
 | 参数组 | 优化器 | 学习率 | 说明 |
@@ -65,6 +100,54 @@ for shape in sorted({p.shape for p in matrix_params}):
 - 共享动量 buffer（momentum_buffer）和二阶动量 buffer
 - 减少内存碎片和 kernel launch 开销
 
+### 1.1 Muon 按形状分组与堆叠处理
+
+```mermaid
+graph TD
+    subgraph 输入[Transformer 中的矩阵参数 - 各种形状]
+        P1["Q/K/V weight [512, 512]<br/>×3 per block ×8 blocks"]
+        P2["attn.c_proj [512, 512]<br/>×8 blocks"]
+        P3["MLP fc [512, 2048]<br/>×8 blocks"]
+        P4["MLP proj [2048, 512]<br/>×8 blocks"]
+    end
+
+    subgraph 分组[按形状分组]
+        G1["🗂️ Group [512,512]<br/>~32 个矩阵"]
+        G2["🗂️ Group [512,2048]<br/>~8 个矩阵"]
+        G3["🗂️ Group [2048,512]<br/>~8 个矩阵"]
+    end
+
+    subgraph 堆叠[同形状堆叠批量处理]
+        S1["📦 Stack → [32, 512, 512]"]
+        S2["📦 Stack → [8, 512, 2048]"]
+        S3["📦 Stack → [8, 2048, 512]"]
+    end
+
+    subgraph Muon[Muon step - 每个组独立]
+        M1["🟣 Polar Express<br/>× Newton-Schulz 5 次"]
+        M2["🟣 NorMuon 方差归一化<br/>(按 reduced dim)"]
+        M3["🟣 Cautious Weight Decay<br/>(只衰减正增长参数)"]
+        M4["🟣 参数更新<br/>(Nesterov momentum)"]
+    end
+
+    P1 & P2 --> G1
+    P3 --> G2
+    P4 --> G3
+
+    G1 --> S1
+    G2 --> S2
+    G3 --> S3
+
+    S1 & S2 & S3 --> M1
+    M1 --> M2 --> M3 --> M4
+
+    M4 --> Unbind["📤 Unbind + 写回各参数<br/>torch._foreach_copy_"]
+
+    style 分组 fill:#fde68a
+    style 堆叠 fill:#bfdbfe
+    style Muon fill:#ddd6fe
+```
+
 ---
 
 ## 二、Muon 核心算法详解
@@ -74,6 +157,32 @@ for shape in sorted({p.shape for p in matrix_params}):
 ```
 Muon 更新 = Polar Express 正交化 + NorMuon 方差减少 + Cautious Weight Decay
            (保持权重矩阵的正交性)     (归一化梯度尺度)      (智能 L2 正则)
+```
+
+### 2.1.1 Muon 核心算法：五步更新流程图
+
+```mermaid
+flowchart TD
+    Start(["step() 开始<br/>(一批同形状矩阵)"]) --> Momentum["🌀 Nesterov 动量<br/>m = β_m * m + (1-β_m) * g<br/>g = g + β_m * m"]
+    Momentum --> PreNorm["📏 预归一化<br/>X = g / (||g|| × 1.02 + 1e-6)"]
+    PreNorm --> Branch{"矩阵形状?<br/>rows > cols?"}
+
+    Branch -->|是 - 右正交化| PolarR["⚡ Polar Express (右)<br/>X ← X (Xᵀ X)^(-1/2)<br/>循环 5 次 Newton-Schulz"]
+    Branch -->|否 - 左正交化| PolarL["⚡ Polar Express (左)<br/>X ← (X Xᵀ)^(-1/2) X<br/>循环 5 次 Newton-Schulz"]
+
+    PolarR --> NorMuon["📐 NorMuon 方差归一化<br/>按 reduced dim 计算 EMA 二阶矩<br/>v_mean = β2*v_mean + (1-β2)*E(g²)<br/>g ← g / sqrt(v_mean) × norm_scale"]
+    PolarL --> NorMuon
+
+    NorMuon --> CWD["🎯 Cautious Weight Decay<br/>mask = (g·θ > 0)<br/>只衰减正被梯度推离 0 的参数"]
+    CWD --> Update["✏️ 参数更新<br/>θ ← θ - lr × g - lr × wd × θ × mask"]
+    Update --> End(["完成本组更新"])
+
+    style Momentum fill:#bfdbfe
+    style PolarR fill:#ddd6fe
+    style PolarL fill:#ddd6fe
+    style NorMuon fill:#fde68a
+    style CWD fill:#fecaca
+    style Update fill:#dcfce7
 ```
 
 ### 2.2 Polar Express 正交化
@@ -139,6 +248,30 @@ mask = (g * stacked_params) >= 0
 # 更新: θ = θ - lr * g - lr * wd * θ * mask
 stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 ```
+
+### 2.4.1 Cautious Weight Decay 行为对比图
+
+```mermaid
+graph LR
+    subgraph 标准 AdamW
+        S1["θ > 0, g > 0<br/>(正增长)"] → D1["❌ 衰减 θ<br/>(正确)"]
+        S2["θ > 0, g < 0<br/>(正在减小)"] → D2["❌ 仍衰减 θ<br/>(过度正则化!)"]
+        S3["θ < 0, g < 0<br/>(负增长)"] → D3["❌ 衰减 θ<br/>(正确)"]
+        S4["θ < 0, g > 0<br/>(正在减小)"] → D4["❌ 仍衰减 θ<br/>(过度正则化!)"]
+    end
+
+    subgraph Cautious WD
+        C1["θ > 0, g > 0<br/>(正增长)"] → E1["✅ 衰减 θ<br/>(聪明!)"]
+        C2["θ > 0, g < 0<br/>(正在减小)"] → E2["✅ 不衰减<br/>(让它自然减小!)"]
+        C3["θ < 0, g < 0<br/>(负增长)"] → E3["✅ 衰减 θ<br/>(聪明!)"]
+        C4["θ < 0, g > 0<br/>(正在减小)"] → E4["✅ 不衰减<br/>(让它自然减小!)"]
+    end
+
+    style 标准 AdamW fill:#fee2e2
+    style Cautious WD fill:#dcfce7
+```
+
+**条件简记**：`mask = (g × θ > 0)` → 只在"梯度和参数同号"时衰减。
 
 **对比**：
 

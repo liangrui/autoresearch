@@ -273,6 +273,41 @@ flowchart TD
             pos += remaining  # 填满了
 ```
 
+### 5.2.1 Best-Fit 打包算法可视化
+
+```mermaid
+flowchart LR
+    subgraph 输入[文档 Buffer - 1000 个已编码文档]
+        D1["📄 doc1 (len=800)"]
+        D2["📄 doc2 (len=1500)"]
+        D3["📄 doc3 (len=500)"]
+        D4["📄 doc4 (len=2100)"]
+        Dn["... 更多文档"]
+    end
+
+    subgraph 打包[每行 Best-Fit 打包]
+        Row["📋 行容量 = 2049 (T+1)"]
+        FindMax["🔍 找最大能放下的文档<br/>max_len <= remaining"]
+        Fill["✅ 完整放入<br/>row[pos:pos+len] = doc_tokens"]
+        Truncate["✂️ 没有文档能放下<br/>→ 截断最短文档填满"]
+    end
+
+    subgraph 输出[输出 Buffer - 100% 利用率]
+        Out["📤 row_buffer[128, 2049]<br/>每行 = [BOS, doc1, BOS, doc2...]"]
+    end
+
+    D1 & D2 & D3 & D4 & Dn --> FindMax
+    FindMax -->|找到最大能放下的| Fill
+    Fill -->|还有空间| FindMax
+    FindMax -->|放不下任何文档| Truncate
+    Fill --> Out
+    Truncate --> Out
+
+    style Truncate fill:#fde68a
+    style FindMax fill:#bfdbfe
+    style Out fill:#dcfce7
+```
+
 **算法特点：**
 - 每次都找"最大的能放下"的文档 → 减少浪费
 - 当行尾有剩余空间但没有文档能完整放下时，截断最短文档填满
@@ -317,6 +352,32 @@ yield inputs, targets, epoch
 - 每一行的第一个 token 总是 BOS
 - 模型可以用 BOS 的存在来检测文档边界
 - 文档之间不需要额外的分隔符
+
+---
+
+### 5.4 DataLoader 内存流水线图
+
+```mermaid
+graph LR
+    subgraph CPU[CPU 内存]
+        RB["row_buffer<br/>[128, 2049] int64<br/>(构建打包)"]
+        CB["cpu_buffer<br/>[2 × 128 × 2048] int64<br/>(pin_memory 页锁定)"]
+    end
+
+    subgraph GPU[GPU 显存 - CUDA]
+        GB["gpu_buffer<br/>[2 × 128 × 2048] int64<br/>(训练时直接用)"]
+        In["inputs = gpu_buffer[:B*T].view(B, T)"]
+        Tg["targets = gpu_buffer[B*T:].view(B, T)"]
+    end
+
+    RB -->|拆分 inputs/targets| CB
+    CB -->|异步 PCIe 传输<br/>non_blocking=True| GB
+    GB --> In
+    GB --> Tg
+
+    style CPU fill:#fef3c7
+    style GPU fill:#dbeafe
+```
 
 ---
 
@@ -379,6 +440,45 @@ BPB = (1 / log(2)) × (Σ loss_i × bytes_i) / (Σ bytes_i)
 |-----|---------|-----------------|------------|
 | Perplexity | ✅ 依赖 | ✅ 依赖 | ❌ |
 | BPB | ❌ 不依赖 | ❌ 不依赖 | ✅ |
+
+### 6.1 BPB 计算数据流图
+
+```mermaid
+graph TD
+    subgraph 输入[模型 forward 输出]
+        Loss["loss_flat [B*T]<br/>per-token cross-entropy (nats)"]
+        Y["y_flat [B*T]<br/>target token ids"]
+    end
+
+    subgraph 查表[token_bytes 预计算表]
+        TB["token_bytes.pt<br/>[vocab_size] int32<br/>每个 token 的 UTF-8 字节长度"]
+    end
+
+    subgraph 计算[GPU 向量化计算]
+        Bytes["bytes = token_bytes[y_flat]<br/>[B*T] 每个 target 的字节数"]
+        Mask["mask = bytes > 0<br/>(排除特殊 token: bytes=0)"]
+        MaskedLoss["weighted_loss = loss_flat * mask<br/>[B*T]"]
+        SumNats["Σ weighted_loss<br/>总 nats"]
+        SumBytes["Σ bytes<br/>总字节数"]
+    end
+
+    subgraph 输出[最终指标]
+        BPB["BPB = sum_nats / (log(2) × sum_bytes)<br/>→ bits/byte, 越低越好"]
+    end
+
+    Loss --> MaskedLoss
+    Y --> Bytes
+    TB --> Bytes
+    Bytes --> Mask
+    Bytes --> SumBytes
+    MaskedLoss --> SumNats
+    SumNats --> BPB
+    SumBytes --> BPB
+
+    style 输入 fill:#dbeafe
+    style 计算 fill:#fef3c7
+    style 输出 fill:#dcfce7
+```
 
 这对于 autoresearch 至关重要：Agent 可能会修改词表大小，BPB 仍然是公平的比较基准。
 
